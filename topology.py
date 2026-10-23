@@ -27,6 +27,8 @@ import os
 import platform
 import re
 import socket
+import subprocess
+import sys
 
 from netid import mac_vendor, snmp_get
 
@@ -293,6 +295,86 @@ def build_snmp_topology(seed_ips, community="public", hosts=None, max_switches=1
 
 LLDP_MCAST = "01:80:c2:00:00:0e"
 CDP_MCAST = "01:00:0c:cc:cc:cc"
+
+# ----------------------------------------------------------------------
+#  Npcap: обнаружение и установка «в один клик» прямо из приложения.
+#
+#  Npcap — системный драйвер ядра Windows, и его нельзя «вшить» в exe так,
+#  чтобы он просто заработал без установки: Windows требует, чтобы такие
+#  драйверы были явно установлены (и подписаны) в систему. Но сам
+#  установщик Npcap можно встроить в сборку (--add-data в build.yml) и
+#  запускать его прямо из приложения, когда он нужен — пользователю не
+#  нужно самому идти на npcap.com и скачивать его отдельно, достаточно
+#  один раз подтвердить запрос UAC.
+# ----------------------------------------------------------------------
+
+def npcap_installed():
+    """True, если на машине уже установлен Npcap (или совместимый WinPcap)."""
+    if not IS_WIN:
+        return True  # на Linux/macOS достаточно root, см. has_sniff_privileges
+    sysdir = os.environ.get("SystemRoot", r"C:\Windows")
+    for p in (os.path.join(sysdir, "System32", "Npcap", "wpcap.dll"),
+              os.path.join(sysdir, "System32", "Npcap", "Packet.dll"),
+              os.path.join(sysdir, "System32", "wpcap.dll")):      # старый WinPcap/совместимый режим
+        if os.path.isfile(p):
+            return True
+    try:
+        import winreg
+        winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\npcap")
+        return True
+    except Exception:
+        return False
+
+
+def bundled_npcap_installer_path():
+    """Путь к установщику Npcap, встроенному в сборку через --add-data
+    (см. build.yml). Работает и из исходников (assets/рядом с файлом), и
+    из собранного PyInstaller-exe (sys._MEIPASS). None, если не найден —
+    тогда предложите пользователю скачать Npcap с npcap.com вручную."""
+    bases = []
+    if getattr(sys, "frozen", False):
+        bases.append(getattr(sys, "_MEIPASS", os.path.dirname(sys.executable)))
+        bases.append(os.path.dirname(sys.executable))
+    bases.append(os.path.dirname(os.path.abspath(__file__)))
+    for base in bases:
+        p = os.path.join(base, "assets", "npcap-installer.exe")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def install_npcap():
+    """Запускает встроенный установщик Npcap с запросом прав администратора
+    (UAC) и тихой установкой (/S). Блокирует вызывающий поток до завершения
+    установки — вызывайте из фонового потока, не из главного цикла Tk.
+    Возвращает (ok: bool, message: str)."""
+    if not IS_WIN:
+        return False, "Установка Npcap нужна только на Windows."
+    installer = bundled_npcap_installer_path()
+    if not installer:
+        return False, ("Установщик Npcap не найден внутри приложения. "
+                        "Скачайте и установите его вручную: https://npcap.com/#download")
+    try:
+        # ShellExecuteW с verb="runas" сам показывает диалог UAC; /S - тихая
+        # установка после того, как пользователь подтвердит повышение прав.
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", installer, "/S", None, 1)
+        if rc <= 32:   # ShellExecute возвращает <=32 при ошибке (см. документацию WinAPI)
+            if rc == 5:
+                return False, "Установка отменена: нужно подтвердить запрос администратора (UAC)."
+            return False, f"Не удалось запустить установщик Npcap (код {rc})."
+    except Exception as e:
+        return False, f"Не удалось запустить установщик Npcap: {e}"
+    # ShellExecute не блокирует и не даёт хэндл процесса - ждём появления
+    # файла драйвера как признака завершения (silent-установка обычно
+    # укладывается в несколько секунд).
+    import time
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if npcap_installed():
+            return True, "Npcap установлен."
+        time.sleep(1)
+    return False, ("Установщик запущен, но Npcap пока не обнаружен — возможно, установка "
+                   "ещё идёт или была закрыта. Проверьте и повторите при необходимости.")
 
 
 def has_sniff_privileges():

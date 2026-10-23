@@ -23,6 +23,7 @@ import platform
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
@@ -389,6 +390,10 @@ def main() -> None:
                     help="сетевой интерфейс для --passive-topology (по умолчанию — "
                          "выбор scapy по умолчанию)")
     ap.add_argument("--passive-dot", metavar="FILE", help="куда сохранить DOT для --passive-topology")
+    ap.add_argument("--install-npcap", action="store_true",
+                    help="установить встроенный в сборку драйвер Npcap (нужен для "
+                         "--passive-topology на Windows) и выйти; запросит права "
+                         "администратора (UAC)")
     ap.add_argument("--mdns", action="store_true",
                     help="дополнительно выполнить mDNS/Bonjour-поиск (порт 5353: принтеры "
                          "AirPrint, Chromecast, AirPlay/колонки и т.п.)")
@@ -406,6 +411,11 @@ def main() -> None:
                     help="файл JSON с историей для --watch (по умолчанию "
                          "netscan_history.json в текущей папке)")
     args = ap.parse_args()
+
+    if args.install_npcap:
+        ok, msg = topology.install_npcap()
+        print(msg)
+        sys.exit(0 if ok else 1)
 
     networks = args.networks or [detect_local_network()]
     print("Подсети:", ", ".join(networks))
@@ -443,9 +453,12 @@ def main() -> None:
     if args.passive_topology:
         if not topology.SCAPY_AVAILABLE:
             print("Пассивная топология недоступна: scapy не установлен (pip install scapy).")
+        elif topology.IS_WIN and not topology.npcap_installed():
+            print("Пассивная топология недоступна: не установлен Npcap. "
+                  "Запустите: netscan.py --install-npcap  (один раз, запросит права "
+                  "администратора)")
         elif not topology.has_sniff_privileges():
-            print("Пассивная топология недоступна: нужны права администратора/root"
-                  + (" и установленный Npcap (npcap.com)." if topology.IS_WIN else "."))
+            print("Пассивная топология недоступна: нужны права администратора/root.")
         else:
             print(f"Слушаю LLDP/CDP {args.passive_topology:.0f} сек на интерфейсе "
                   f"{args.iface or '(по умолчанию)'}...")

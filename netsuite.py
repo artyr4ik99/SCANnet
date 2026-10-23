@@ -975,7 +975,7 @@ def open_capture(url):
 
 
 class CameraWorker(threading.Thread):
-    def __init__(self, cam, settings, log, report_path_found=None):
+    def __init__(self, cam, settings, log):
         super().__init__(daemon=True)
         self.cam = dict(cam)
         self.settings = settings
@@ -1017,12 +1017,6 @@ class CameraWorker(threading.Thread):
         self.focused = False
         self.use_sub = self.has_sub
         self._switch_stream = False
-        # --- автоподбор рабочего пути и устойчивость к нестабильной сети
-        self.report_path_found = report_path_found  # cb(cam_id, is_sub, path) -> персист в конфиг
-        self._autofind_done = False
-        self._fail_times = collections.deque(maxlen=20)   # моменты обрывов основного потока
-        self.auto_degraded = False     # True = временно ушли на суб-поток из-за нестабильности
-        self._last_main_retry = 0.0
         # --- звук
         self.sound_proc = None
         self.sound_on = False
@@ -1034,11 +1028,8 @@ class CameraWorker(threading.Thread):
         self._stop_copy_proc()
 
     def set_focused(self, focused):
-        """Переключает поток: в сетке — лёгкий суб-поток, в фокусе — основной.
-        Если сейчас действует временный переход на суб-поток из-за нестабильной
-        сети (auto_degraded), не дёргаем обратно на основной — им займётся
-        периодическая попытка возврата внутри run()."""
-        want_sub = self.has_sub and (not focused or self.auto_degraded)
+        """Переключает поток: в сетке — лёгкий суб-поток, в фокусе — основной."""
+        want_sub = self.has_sub and not focused
         self.focused = focused
         if want_sub != self.use_sub:
             self.use_sub = want_sub
@@ -1060,55 +1051,6 @@ class CameraWorker(threading.Thread):
         self.last_error = err
         self._set("offline", err, log=False)
         self._sleep(backoff)
-
-    # ---- устойчивость к нестабильной сети: учёт обрывов ОСНОВНОГО потока
-    def _record_main_failure(self):
-        """Вызывается при любом обрыве/неудаче именно основного потока.
-        Если это была пробная попытка вернуться на основной после деградации —
-        сразу откатываемся обратно на суб-поток, следующая попытка — через
-        _MAIN_RETRY_SEC."""
-        if self.use_sub or not self.has_sub:
-            return
-        now = time.time()
-        self._fail_times.append(now)
-        if self.auto_degraded:
-            self.use_sub = True
-            self._last_main_retry = now
-            self.log(f"[{self.cam['name']}] основной поток всё ещё нестабилен — возвращаюсь на суб-поток")
-
-    def _record_main_recovered(self):
-        """Основной поток продержался достаточно долго — считаем его снова стабильным."""
-        if self.use_sub or not self.has_sub:
-            return
-        if self.auto_degraded:
-            self.auto_degraded = False
-            self._fail_times.clear()
-            self.log(f"[{self.cam['name']}] основной поток снова стабилен")
-
-    _MAIN_RETRY_SEC = 90        # как часто пробовать вернуться на основной поток
-    _MAIN_FAIL_WINDOW = 120     # окно, в котором считаем обрывы «частыми»
-    _MAIN_FAIL_THRESHOLD = 3    # столько обрывов за окно -> уходим на суб-поток
-    _MAIN_STABLE_SEC = 15       # столько сек. без обрыва -> поток снова «стабилен»
-
-    def _maybe_adjust_stream(self):
-        """Решает, не пора ли временно перейти на суб-поток (частые обрывы
-        основного) или наоборот — попробовать вернуться на основной."""
-        if not self.has_sub:
-            return
-        now = time.time()
-        if self.focused and not self.use_sub and not self.auto_degraded:
-            recent = [t for t in self._fail_times if now - t < self._MAIN_FAIL_WINDOW]
-            if len(recent) >= self._MAIN_FAIL_THRESHOLD:
-                self.use_sub = True
-                self.auto_degraded = True
-                self._last_main_retry = now
-                self.log(f"[{self.cam['name']}] частые обрывы основного потока — "
-                         f"временно перешёл на суб-поток")
-        elif self.auto_degraded and self.use_sub and \
-                now - self._last_main_retry > self._MAIN_RETRY_SEC:
-            self.use_sub = False
-            self._last_main_retry = now
-            self.log(f"[{self.cam['name']}] пробую вернуться на основной поток…")
 
     # ---- звук (ffplay, без перекодирования видео — только аудиодорожка)
     def set_sound(self, on):
@@ -1146,35 +1088,11 @@ class CameraWorker(threading.Thread):
             self.sound_proc = None
 
     # ---- основной цикл
-    def _try_autofind_path(self, c):
-        """Авто-подбор рабочего RTSP-пути: перебирает типовые шаблоны
-        производителей (CANDIDATE_PATHS/CANDIDATE_SUB_PATHS, см. начало
-        файла) и, если находит отвечающий поток, сохраняет его — и в
-        текущий self.cam, и (через report_path_found) в конфигурацию
-        камеры, чтобы при следующем запуске подбор не повторялся.
-        Возвращает True, если путь найден и применён."""
-        self._autofind_done = True
-        self._set("connecting", "Путь не отвечает — подбираю рабочий поток автоматически…")
-        found, _ = find_paths(c["ip"], c["port"], c["user"], c["password"])
-        if not found:
-            return False
-        new_path = found[0][0]
-        key = "path_sub" if self.use_sub else "path"
-        c[key] = new_path
-        self.log(f"[{c['name']}] автоподбор нашёл рабочий {'суб-' if self.use_sub else ''}поток: {new_path}")
-        if self.report_path_found:
-            try:
-                self.report_path_found(c["id"], self.use_sub, new_path)
-            except Exception:
-                pass
-        return True
-
     def run(self):
         c = self.cam
         backoff = 3
         try:
             while self.running:
-                self._maybe_adjust_stream()
                 self._switch_stream = False
                 self._set("connecting", "Подключение…", log=False)
                 path = c.get("path_sub") or c["path"] if self.use_sub else c["path"]
@@ -1182,36 +1100,27 @@ class CameraWorker(threading.Thread):
                 if codec:
                     self.codec = codec
                 if code is None:
-                    self._record_main_failure()
                     self._fail(text[0].upper() + text[1:], backoff)
                     backoff = min(backoff * 2, 30)
                     continue
                 if code == 401:
-                    self._record_main_failure()
                     self._fail("401: неверный логин или пароль", backoff)
                     backoff = min(backoff * 2, 30)
                     continue
                 if code == 404:
-                    if not self._autofind_done and self._try_autofind_path(c):
-                        continue  # сразу пробуем найденный путь, без роста backoff
-                    self._record_main_failure()
-                    self._fail("404: неверный путь потока"
-                               + (" (автоподбор не нашёл альтернативы)" if self._autofind_done else ""),
-                               backoff)
+                    self._fail("404: неверный путь потока", backoff)
                     backoff = min(backoff * 2, 30)
                     continue
 
                 cap = open_capture(build_url(c, sub=self.use_sub))
                 if not cap.isOpened():
                     cap.release()
-                    self._record_main_failure()
                     self._fail("RTSP отвечает, но видео не открылось (кодек H.265? попробуйте H.264 / доп. поток)",
                                backoff)
                     backoff = min(backoff * 2, 30)
                     continue
 
                 backoff = 3
-                self._autofind_done = False
                 self.last_error = ""
                 self.connected_at = time.time()
                 self._set("online", "Онлайн" + ("  (суб-поток)" if self.use_sub else ""))
@@ -1223,10 +1132,6 @@ class CameraWorker(threading.Thread):
                     self.disp = None
                     self.full = None
                 self.fps = 0.0
-                if time.time() - self.connected_at >= self._MAIN_STABLE_SEC:
-                    self._record_main_recovered()
-                else:
-                    self._record_main_failure()
                 if self.running and not self._switch_stream:
                     self.reconnects += 1
                     self._set("connecting", "Поток прерван, переподключение…")
@@ -1236,21 +1141,12 @@ class CameraWorker(threading.Thread):
             self._stop_copy_proc()
             self._stop_sound()
 
-    _READ_FAIL_TOLERANCE = 3   # столько подряд неудачных cap.read() терпим перед разрывом —
-                               # сглаживает кратковременные «заикания» нестабильной сети
-
     def _read_loop(self, cap):
         n, t0, last_motion, first = 0, time.time(), 0.0, True
-        fail_streak = 0
         while self.running and not self._switch_stream:
             ok, frame = cap.read()
             if not ok or frame is None:
-                fail_streak += 1
-                if fail_streak >= self._READ_FAIL_TOLERANCE:
-                    return
-                time.sleep(0.15)
-                continue
-            fail_streak = 0
+                return
             now = time.time()
             h, w = frame.shape[:2]
             self.size = (w, h)
@@ -2270,11 +2166,20 @@ class ScanWindow(tk.Toplevel):
                 "Для этой функции нужен пакет scapy (pip install scapy) — "
                 "он не установлен.", parent=self)
             return
+        if os.name == "nt" and not topology.npcap_installed():
+            if messagebox.askyesno(
+                    "Пассивная топология",
+                    "Для прослушивания LLDP/CDP на Windows нужен драйвер Npcap — "
+                    "он не установлен. Установить сейчас? Будет запрошено "
+                    "подтверждение администратора (UAC), установка тихая "
+                    "(обычно несколько секунд).", parent=self):
+                self.status.set("Устанавливаю Npcap (подтвердите запрос администратора)…")
+                self.app.run_bg(topology.install_npcap, self._on_npcap_installed)
+            return
         if not topology.has_sniff_privileges():
-            hint = " и установленный Npcap (npcap.com)" if os.name == "nt" else ""
             messagebox.showwarning(
                 "Пассивная топология",
-                f"Нужны права администратора/root{hint}. Перезапустите приложение "
+                "Нужны права администратора/root. Перезапустите приложение "
                 "с повышенными правами и повторите.", parent=self)
             return
         duration = simpledialog.askinteger(
@@ -2291,6 +2196,18 @@ class ScanWindow(tk.Toplevel):
             return topology.build_passive_topology(duration=duration, hosts=hosts)
 
         self.app.run_bg(work, self._on_passive_topology)
+
+    def _on_npcap_installed(self, res):
+        if isinstance(res, Exception):
+            self.status.set(f"Ошибка установки Npcap: {res}")
+            return
+        ok, msg = res
+        self.status.set(msg)
+        if ok:
+            messagebox.showinfo("Пассивная топология", msg + "\nНажмите «Пассивная топология» ещё раз.",
+                                parent=self)
+        else:
+            messagebox.showwarning("Пассивная топология", msg, parent=self)
 
     def _on_passive_topology(self, res):
         if isinstance(res, Exception):
@@ -3161,7 +3078,7 @@ class App(tk.Tk):
             wk.set_sound(bool(cam.get("sound", False)))
         for cid, cam in want.items():
             if cid not in self.workers:
-                wk = CameraWorker(cam, self.settings, self.log, report_path_found=self._report_path_found)
+                wk = CameraWorker(cam, self.settings, self.log)
                 wk.start()
                 self.workers[cid] = wk
 
@@ -3287,22 +3204,6 @@ class App(tk.Tk):
         self.sync_focus()
         self.rebuild_tiles()
 
-    def _report_path_found(self, cid, is_sub, path):
-        """Вызывается из потока CameraWorker (см. CameraWorker._try_autofind_path) —
-        безопасно переносим сохранение в основной поток через ui_q."""
-        self.ui_q.put((self._apply_found_path, (cid, is_sub, path)))
-
-    def _apply_found_path(self, args):
-        cid, is_sub, path = args
-        cam = self.cam_by_id(cid)
-        if not cam:
-            return
-        key = "path_sub" if is_sub else "path"
-        if cam.get(key) != path:
-            cam[key] = path
-            save_config(self.cfg)
-            self.log(f"[{cam['name']}] автоподбор: путь сохранён в конфигурацию ({path})")
-
     # ---------- раскладка ----------
     def on_layout(self, _=None):
         self.cfg["layout"] = self.layout_var.get()
@@ -3351,32 +3252,10 @@ class App(tk.Tk):
             self.toggle_focus(self.focus_id)
 
     def toggle_fullscreen(self, _=None):
-        """F11 или повторное нажатие — включает/выключает настоящий полноэкранный
-        режим (поверх панели задач Windows). Esc тоже выходит — см. on_escape."""
         self.fs = not self.fs
-        if self.fs:
-            try:
-                self._pre_fs_geometry = self.geometry()
-            except tk.TclError:
-                self._pre_fs_geometry = None
-            self.attributes("-fullscreen", True)
-        else:
-            self.attributes("-fullscreen", False)
-            geo = getattr(self, "_pre_fs_geometry", None)
-            if geo:
-                self.after(10, lambda: self.geometry(geo))
+        self.attributes("-fullscreen", self.fs)
         for w in (self.header, self.statusbar, self.toolbar, self.side, self.logframe):
             w.grid_remove() if self.fs else w.grid()
-        # Страховка от артефактов Windows при включённом fullscreen сразу после
-        # смены разрешения/монитора: переустановка атрибута гарантированно
-        # пересчитывает геометрию под актуальный экран.
-        self.after(60, self._reassert_fullscreen_geometry)
-
-    def _reassert_fullscreen_geometry(self):
-        if self.fs:
-            self.attributes("-fullscreen", False)
-            self.attributes("-fullscreen", True)
-            self.focus_force()
 
     def rebuild_tiles(self):
         for t in self.tiles:
