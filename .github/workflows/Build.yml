@@ -1,0 +1,65 @@
+name: Build EXE
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Установить зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      # Npcap нужен для scapy (пассивное прослушивание LLDP/CDP,
+      # topology.build_passive_topology). Сам .exe НЕ включает Npcap —
+      # это системный драйвер, который должен быть установлен отдельно на
+      # машине, где запускается NetSuite.exe/NetScan.exe, если нужна именно
+      # эта функция (остальной функционал работает без него). Здесь мы
+      # ставим Npcap только для того, чтобы на раннере корректно
+      # импортировался модуль scapy во время сборки/тестовой проверки.
+      - name: Установить Npcap (для сборки с scapy)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-1.79.exe" -OutFile "npcap-installer.exe"
+          Start-Process -FilePath "npcap-installer.exe" -ArgumentList "/S" -Wait
+          Remove-Item "npcap-installer.exe"
+
+      - name: Проверить импорт модулей
+        run: |
+          python -c "import netid, topology, risk, netscan; print('modules OK')"
+
+      - name: Собрать NetSuite.exe (GUI)
+        run: |
+          pyinstaller --onefile --windowed --name NetSuite --icon assets\netsuite.ico --add-data "assets\netsuite.ico;assets" --add-data "assets\netsuite.png;assets" netsuite.py
+
+      - name: Собрать NetScan.exe (консоль)
+        run: |
+          pyinstaller --onefile --console --name NetScan --icon assets\netsuite.ico netscan.py
+
+      - name: Сохранить артефакты сборки
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: |
+            dist\NetSuite.exe
+            dist\NetScan.exe
+
+      - name: Создать GitHub Release (по тегу)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/NetSuite.exe
+            dist/NetScan.exe
