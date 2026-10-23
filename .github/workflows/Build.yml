@@ -21,21 +21,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      # Npcap нужен для scapy (пассивное прослушивание LLDP/CDP,
-      # topology.build_passive_topology). Сам .exe НЕ включает Npcap —
-      # это системный драйвер, который должен быть установлен отдельно на
-      # машине, где запускается NetSuite.exe/NetScan.exe, если нужна именно
-      # эта функция (остальной функционал работает без него). Здесь мы
-      # ставим Npcap только для того, чтобы на раннере корректно
-      # импортировался модуль scapy во время сборки/тестовой проверки.
-      - name: Установить Npcap (для сборки с scapy)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-1.79.exe" -OutFile "npcap-installer.exe"
-          Start-Process -FilePath "npcap-installer.exe" -ArgumentList "/S" -Wait
-          Remove-Item "npcap-installer.exe"
-
+      # Npcap на раннере не ставим: scapy без него на Windows при импорте
+      # просто пишет предупреждение в stderr ("No libpcap provider available")
+      # и отключает захват пакетов (conf.use_pcap = False) — импорт и сборка
+      # от этого не падают. Сам .exe Npcap всё равно не включает — это
+      # системный драйвер, который конечный пользователь ставит отдельно на
+      # своей машине, если ему нужна пассивная топология (LLDP/CDP,
+      # topology.build_passive_topology); остальной функционал работает без него.
       - name: Проверить импорт модулей
         run: |
           python -c "import netid, topology, risk, netscan; print('modules OK')"
